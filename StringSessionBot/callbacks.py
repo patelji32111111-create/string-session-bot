@@ -1,10 +1,12 @@
 import traceback
+import asyncio
 
 from Data import Data
 from pyrogram import Client
-from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from StringSessionBot.generate import generate_session
+from pyrogram.types import CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Message
+from pyrogram import filters
 
+from StringSessionBot.generate import generate_session, active_tasks, cancel_generation
 
 ERROR_MESSAGE = (
     "⚠️ ᴏᴏᴘs! ᴀɴ ᴇxᴄᴇᴘᴛɪᴏɴ ᴏᴄᴄᴜʀʀᴇᴅ!\n\n"
@@ -15,15 +17,14 @@ ERROR_MESSAGE = (
 
 @Client.on_callback_query()
 async def _callbacks(bot: Client, callback_query: CallbackQuery):
-
     try:
         query = callback_query.data.lower()
+        chat_id = callback_query.message.chat.id
+        message_id = callback_query.message.id
+        user_id = callback_query.from_user.id
 
         bot_info = await bot.get_me()
         mention = bot_info.mention
-
-        chat_id = callback_query.message.chat.id
-        message_id = callback_query.message.id
 
         # ================= HOME =================
         if query == "home":
@@ -79,19 +80,60 @@ async def _callbacks(bot: Client, callback_query: CallbackQuery):
 
         # ================= SESSION GENERATION =================
         elif query in ["pyrogram", "telethon"]:
+            # Check if already generating for this user
+            if user_id in active_tasks and not active_tasks[user_id].done():
+                await callback_query.answer("⚠️ Already generating. Please wait or use /cancel.", show_alert=True)
+                return
+
             await callback_query.answer("Generating session...")
 
+            # Send a message with Cancel button
+            cancel_buttons = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("❌ Cancel", callback_data="cancel_gen")]]
+            )
+            status_msg = await callback_query.message.reply(
+                "🔄 **Session generation started...**\n"
+                "You can click the **Cancel** button or send `/cancel` to abort.",
+                reply_markup=cancel_buttons
+            )
+
             try:
-                if query == "pyrogram":
-                    await generate_session(bot, callback_query.message)
-                else:
-                    await generate_session(bot, callback_query.message, telethon=True)
+                # Start generation task
+                task = asyncio.create_task(
+                    generate_session(bot, status_msg, telethon=(query == "telethon"))
+                )
+                active_tasks[user_id] = task
+
+                # Wait for completion
+                await task
+
+            except asyncio.CancelledError:
+                await status_msg.edit(
+                    "⛔ **Generation cancelled.**",
+                    reply_markup=None
+                )
+                return
 
             except Exception as e:
                 print(traceback.format_exc())
-                await callback_query.message.reply(
-                    ERROR_MESSAGE.format(str(e))
+                await status_msg.edit(
+                    ERROR_MESSAGE.format(str(e)),
+                    reply_markup=None
                 )
+            finally:
+                active_tasks.pop(user_id, None)
+
+        # ================= CANCEL GENERATION =================
+        elif query == "cancel_gen":
+            user_id = callback_query.from_user.id
+            if await cancel_generation(user_id):
+                await callback_query.answer("✅ Generation cancelled.", show_alert=True)
+                await callback_query.message.edit(
+                    "⛔ **Generation cancelled.**",
+                    reply_markup=None
+                )
+            else:
+                await callback_query.answer("ℹ️ No active generation.", show_alert=True)
 
     except Exception as e:
         print(traceback.format_exc())
@@ -101,3 +143,13 @@ async def _callbacks(bot: Client, callback_query: CallbackQuery):
             )
         except:
             pass
+
+
+# ================= COMMAND: /cancel =================
+@Client.on_message(filters.command("cancel") & filters.private)
+async def cancel_cmd(bot: Client, message: Message):
+    user_id = message.from_user.id
+    if await cancel_generation(user_id):
+        await message.reply("⛔ **Generation cancelled.**")
+    else:
+        await message.reply("ℹ️ No active generation to cancel.")
